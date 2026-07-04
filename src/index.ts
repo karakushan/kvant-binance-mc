@@ -7,12 +7,14 @@ import {
   McpError,
 } from "@modelcontextprotocol/sdk/types.js";
 import { FuturesClient } from "./futures-client.js";
+import { GridBotManager } from "./grid-bot.js";
 
 const API_KEY = process.env.BINANCE_API_KEY || '';
 const SECRET_KEY = process.env.BINANCE_SECRET_KEY || '';
 const FUTURES_BASE = 'https://fapi.binance.com';
 
 const futures = API_KEY && SECRET_KEY ? new FuturesClient({ apiKey: API_KEY, secretKey: SECRET_KEY }) : null;
+const gridBot = futures ? new GridBotManager(futures) : null;
 
 async function publicGet(endpoint: string, params?: Record<string, unknown>) {
   const entries = Object.entries(params || {})
@@ -288,6 +290,123 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["symbol"],
       },
     },
+    {
+      name: "futures_grid_setup",
+      description: "Setup a grid trading layout — places multiple LIMIT orders in a price range on futures (requires API key)",
+      inputSchema: {
+        type: "object",
+        properties: {
+          symbol: { type: "string", description: "Trading pair, e.g. NEARUSDT" },
+          side: { type: "string", enum: ["BUY", "SELL", "BOTH"], description: "BUY (long grid), SELL (short grid), BOTH (neutral grid)" },
+          lowerPrice: { type: "number", description: "Lower bound of the grid" },
+          upperPrice: { type: "number", description: "Upper bound of the grid" },
+          grids: { type: "number", description: "Number of grid lines (orders)" },
+          quantity: { type: "number", description: "Quantity per order" },
+          leverage: { type: "number", description: "Leverage to set (optional)" },
+        },
+        required: ["symbol", "side", "lowerPrice", "upperPrice", "grids", "quantity"],
+      },
+    },
+    {
+      name: "futures_grid_cancel",
+      description: "Cancel all orders for a symbol (requires API key)",
+      inputSchema: {
+        type: "object",
+        properties: {
+          symbol: { type: "string", description: "Trading pair" },
+        },
+        required: ["symbol"],
+      },
+    },
+    {
+      name: "futures_grid_start",
+      description: "Start an automated grid bot that places and replenishes orders (requires API key)",
+      inputSchema: {
+        type: "object",
+        properties: {
+          symbol: { type: "string", description: "Trading pair, e.g. NEARUSDT" },
+          lowerPrice: { type: "number", description: "Lower bound of the grid" },
+          upperPrice: { type: "number", description: "Upper bound of the grid" },
+          grids: { type: "number", description: "Number of grid lines (orders)" },
+          quantity: { type: "number", description: "Quantity per order" },
+          leverage: { type: "number", description: "Leverage to set (optional)" },
+        },
+        required: ["symbol", "lowerPrice", "upperPrice", "grids", "quantity"],
+      },
+    },
+    {
+      name: "futures_grid_status",
+      description: "Check grid bot status for a symbol (requires API key)",
+      inputSchema: {
+        type: "object",
+        properties: {
+          symbol: { type: "string", description: "Trading pair (omit for all bots)" },
+        },
+      },
+    },
+    {
+      name: "futures_grid_stop",
+      description: "Stop and cancel grid bot for a symbol (requires API key)",
+      inputSchema: {
+        type: "object",
+        properties: {
+          symbol: { type: "string", description: "Trading pair" },
+        },
+        required: ["symbol"],
+      },
+    },
+
+    // === OFFICIAL BINANCE GRID API ===
+    {
+      name: "futures_grid_api_create",
+      description: "Create a grid order via Binance Futures Grid API - appears as real Grid bot in Binance UI (requires API key with ENABLE_GRID permission)",
+      inputSchema: {
+        type: "object",
+        properties: {
+          symbol: { type: "string", description: "Trading pair, e.g. NEARUSDT" },
+          side: { type: "string", enum: ["LONG", "SHORT", "NEUTRAL"], description: "LONG (buy grid), SHORT (sell grid), NEUTRAL (both)" },
+          quantity: { type: "number", description: "Total quantity (not per grid) in quote asset or base asset depending on totalType" },
+          leverage: { type: "number", description: "Leverage value" },
+          totalType: { type: "string", enum: ["AMOUNT", "QTY"], description: "AMOUNT = total USDT value, QTY = total coin quantity (default: AMOUNT)" },
+          stopPrice: { type: "number", description: "Optional stop trigger price" },
+          triggerPriceType: { type: "string", enum: ["MARK_PRICE", "CONTRACT_PRICE"], description: "stopPrice trigger type" },
+        },
+        required: ["symbol", "side", "quantity", "leverage"],
+      },
+    },
+    {
+      name: "futures_grid_api_close",
+      description: "Close/cancel a grid order via Binance Grid API (requires API key)",
+      inputSchema: {
+        type: "object",
+        properties: {
+          symbol: { type: "string", description: "Trading pair" },
+          gridOrderId: { type: "number", description: "Grid order ID to close (optional - closes all if omitted)" },
+        },
+        required: ["symbol"],
+      },
+    },
+    {
+      name: "futures_grid_api_open_orders",
+      description: "Get open grid orders from Binance Grid API (requires API key)",
+      inputSchema: {
+        type: "object",
+        properties: {
+          symbol: { type: "string", description: "Trading pair (optional)" },
+          limit: { type: "number", description: "Number of records (default 100, max 100)" },
+        },
+      },
+    },
+    {
+      name: "futures_grid_api_position",
+      description: "Get running grid position details from Binance Grid API (requires API key)",
+      inputSchema: {
+        type: "object",
+        properties: {
+          symbol: { type: "string", description: "Trading pair (optional)" },
+        },
+      },
+    },
   ],
 }));
 
@@ -469,6 +588,126 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             }, null, 2),
           }],
         };
+      }
+
+      case "futures_grid_setup": {
+        if (!futures) throw new McpError(ErrorCode.InvalidRequest, "BINANCE_API_KEY and BINANCE_SECRET_KEY required");
+        const { symbol, side, lowerPrice, upperPrice, grids, quantity, leverage } = args as any;
+
+        const [ticker, info] = await Promise.all([
+          publicGet('/fapi/v1/ticker/price', { symbol }) as any,
+          publicGet('/fapi/v1/exchangeInfo', { symbol }) as any,
+        ]);
+        const currentPrice = parseFloat(ticker.price);
+        const filters = info.symbols[0].filters as any[];
+        const lotSize = filters.find((f: any) => f.filterType === 'LOT_SIZE');
+        const priceFilter = filters.find((f: any) => f.filterType === 'PRICE_FILTER');
+        const stepSize = parseFloat(lotSize?.stepSize || '0.001');
+        const tickSize = parseFloat(priceFilter?.tickSize || '0.001');
+        const minQty = parseFloat(lotSize?.minQty || '0.001');
+
+        if (quantity < minQty) throw new Error(`Quantity ${quantity} < minQty ${minQty}`);
+
+        if (leverage) await futures.changeLeverage({ symbol, leverage });
+
+        const step = (upperPrice - lowerPrice) / (grids - 1);
+        const prices: number[] = [];
+        for (let i = 0; i < grids; i++) {
+          const raw = lowerPrice + step * i;
+          const rounded = Math.round(raw / tickSize) * tickSize;
+          prices.push(rounded);
+        }
+
+        const roundQty = (qty: number) => Math.floor(qty / stepSize) * stepSize;
+
+        const orders: any[] = [];
+        const errors: any[] = [];
+
+        for (const price of prices) {
+          let orderSide: string | null = null;
+          if (side === 'BUY' && price < currentPrice) orderSide = 'BUY';
+          else if (side === 'SELL' && price > currentPrice) orderSide = 'SELL';
+          else if (side === 'BOTH') orderSide = price < currentPrice ? 'BUY' : 'SELL';
+
+          if (orderSide && Math.abs(price - currentPrice) / currentPrice > 0.001) {
+            try {
+              const order = await futures.newOrder({
+                symbol, side: orderSide, type: 'LIMIT',
+                timeInForce: 'GTC',
+                price: price,
+                quantity: roundQty(quantity),
+              });
+              orders.push(order);
+            } catch (e: any) {
+              errors.push({ price, side: orderSide, error: e.message });
+            }
+          }
+        }
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              symbol, side, lowerPrice, upperPrice, grids, currentPrice,
+              placed: orders.length,
+              orders,
+              errors: errors.length ? errors : undefined,
+            }, null, 2),
+          }],
+        };
+      }
+
+      case "futures_grid_cancel": {
+        if (!futures) throw new McpError(ErrorCode.InvalidRequest, "BINANCE_API_KEY and BINANCE_SECRET_KEY required");
+        const data = await futures.cancelAllOrders(args as Record<string, unknown>);
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      }
+
+      case "futures_grid_start": {
+        if (!gridBot) throw new McpError(ErrorCode.InvalidRequest, "BINANCE_API_KEY and BINANCE_SECRET_KEY required");
+        const { symbol, lowerPrice, upperPrice, grids, quantity, leverage = 10 } = args as any;
+        const msg = await gridBot.start({ symbol, lowerPrice, upperPrice, grids, quantity, leverage });
+        return { content: [{ type: "text", text: msg }] };
+      }
+
+      case "futures_grid_status": {
+        if (!gridBot) throw new McpError(ErrorCode.InvalidRequest, "BINANCE_API_KEY and BINANCE_SECRET_KEY required");
+        const { symbol } = args as any;
+        const status = symbol ? gridBot.getStatus(symbol) : gridBot.list();
+        return {
+          content: [{ type: "text", text: JSON.stringify(status || { error: "No bot found" }, null, 2) }],
+        };
+      }
+
+      case "futures_grid_stop": {
+        if (!gridBot) throw new McpError(ErrorCode.InvalidRequest, "BINANCE_API_KEY and BINANCE_SECRET_KEY required");
+        const msg = await gridBot.stop((args as any).symbol);
+        return { content: [{ type: "text", text: msg }] };
+      }
+
+      // === OFFICIAL BINANCE GRID API ===
+      case "futures_grid_api_create": {
+        if (!futures) throw new McpError(ErrorCode.InvalidRequest, "BINANCE_API_KEY and BINANCE_SECRET_KEY required");
+        const data = await futures.gridContractOrder(args as Record<string, unknown>);
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      }
+
+      case "futures_grid_api_close": {
+        if (!futures) throw new McpError(ErrorCode.InvalidRequest, "BINANCE_API_KEY and BINANCE_SECRET_KEY required");
+        const data = await futures.cancelGridContractOrder(args as Record<string, unknown>);
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      }
+
+      case "futures_grid_api_open_orders": {
+        if (!futures) throw new McpError(ErrorCode.InvalidRequest, "BINANCE_API_KEY and BINANCE_SECRET_KEY required");
+        const data = await futures.getGridOpenOrders(args as Record<string, unknown>);
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      }
+
+      case "futures_grid_api_position": {
+        if (!futures) throw new McpError(ErrorCode.InvalidRequest, "BINANCE_API_KEY and BINANCE_SECRET_KEY required");
+        const data = await futures.getGridPosition(args as Record<string, unknown>);
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
       }
 
       default:

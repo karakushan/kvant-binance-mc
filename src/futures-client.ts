@@ -20,7 +20,7 @@ export class FuturesClient {
     return new URLSearchParams(entries).toString();
   }
 
-  private async signedRequest<T>(method: string, endpoint: string, params?: Record<string, unknown>): Promise<T> {
+  async signedRequest<T>(method: string, endpoint: string, params?: Record<string, unknown>): Promise<T> {
     const allParams: Record<string, unknown> = {
       ...params,
       timestamp: Date.now(),
@@ -89,5 +89,22 @@ export class FuturesClient {
   }
   async getPositionMode() {
     return this.signedRequest('GET', '/fapi/v1/positionSide/dual');
+  }
+
+  // === Grid Trading API (futures) ===
+  async gridContractOrder(params: Record<string, unknown>) {
+    return this.signedRequest('POST', '/fapi/v1/grid/contract/order', params);
+  }
+  async cancelGridContractOrder(params: Record<string, unknown>) {
+    return this.signedRequest('POST', '/fapi/v1/grid/contract/close', params);
+  }
+  async getGridOpenOrders(params?: Record<string, unknown>) {
+    return this.signedRequest('GET', '/fapi/v1/grid/contract/openOrders', params);
+  }
+  async getGridHistoryOrder(params?: Record<string, unknown>) {
+    return this.signedRequest('GET', '/fapi/v1/grid/contract/history', params);
+  }
+  async getGridPosition(params?: Record<string, unknown>) {
+    return this.signedRequest('GET', '/fapi/v1/grid/contract/position', params);
   }
 }
